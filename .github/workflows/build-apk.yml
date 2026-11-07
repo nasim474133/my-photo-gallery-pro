@@ -1,0 +1,179 @@
+name: Build Android APK
+
+# Push to main korle ba Actions tab theke "Run workflow" dile APK baniye Releases e dibe.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Copy web app files into www
+        run: |
+          mkdir -p www
+          tar --exclude='./.git' --exclude='./.github' --exclude='./www' \
+              --exclude='./node_modules' --exclude='./android' \
+              --exclude='*.zip' --exclude='./README.md' \
+              --exclude='./package.json' --exclude='./package-lock.json' \
+              --exclude='./capacitor.config.json' -cf - . | tar -xf - -C www
+          ls -la www
+
+      - name: Add native share helper
+        run: |
+          cat > www/native-bridge.js <<'EOF'
+          (function () {
+            var C = window.Capacitor;
+            if (!C || !C.isNativePlatform || !C.isNativePlatform()) return;
+
+            function call(plugin, method, opts) {
+              var P = C.Plugins && C.Plugins[plugin];
+              if (P && P[method]) return P[method](opts);
+              return C.nativePromise(plugin, method, opts);
+            }
+
+            function toBase64(blob) {
+              return new Promise(function (resolve, reject) {
+                var r = new FileReader();
+                r.onload = function () { resolve(String(r.result).split(',')[1] || ''); };
+                r.onerror = function () { reject(r.error); };
+                r.readAsDataURL(blob);
+              });
+            }
+
+            // 3MB chunks (multiple of 3 bytes) so big videos do not choke the bridge
+            var CHUNK = 3 * 1024 * 1024;
+
+            async function writeToCache(file, path) {
+              for (var off = 0, first = true; off < file.size || first; off += CHUNK) {
+                var data = await toBase64(file.slice(off, off + CHUNK));
+                var args = { path: path, data: data, directory: 'CACHE' };
+                if (first) { args.recursive = true; await call('Filesystem', 'writeFile', args); first = false; }
+                else { await call('Filesystem', 'appendFile', args); }
+              }
+              var u = await call('Filesystem', 'getUri', { path: path, directory: 'CACHE' });
+              return u.uri;
+            }
+
+            navigator.canShare = function () { return true; };
+
+            navigator.share = async function (data) {
+              data = data || {};
+              var files = data.files || [];
+              var uris = [];
+              var stamp = Date.now();
+              for (var i = 0; i < files.length; i++) {
+                var safe = (stamp + '_' + i + '_' + (files[i].name || 'file')).replace(/[^\w.\-]+/g, '_');
+                uris.push(await writeToCache(files[i], 'share/' + safe));
+              }
+              try {
+                await call('Share', 'share', {
+                  title: data.title || '',
+                  text: data.text || '',
+                  files: uris,
+                  dialogTitle: 'Share'
+                });
+              } catch (e) {
+                if (/cancel/i.test(String((e && e.message) || e))) {
+                  var err = new Error('Share canceled');
+                  err.name = 'AbortError';
+                  throw err;
+                }
+                throw e;
+              }
+            };
+          })();
+          EOF
+          node --check www/native-bridge.js
+          sed -i 's#<script src="app.js"></script>#<script src="native-bridge.js"></script><script src="app.js"></script>#' www/index.html
+          grep -q 'native-bridge.js' www/index.html
+
+      - name: Create Capacitor Android project
+        run: |
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/share@7 @capacitor/filesystem@7
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.nasim.photogallerypro",
+            "appName": "My Photo Gallery Pro",
+            "webDir": "www"
+          }
+          EOF
+          npx cap add android
+          npx cap sync android
+
+      - name: App icon
+        continue-on-error: true
+        run: |
+          GLYPH=(-fill white -draw "roundrectangle 192,340 832,760 60,60" -draw "roundrectangle 380,270 644,360 30,30" -fill '#172554' -draw "circle 512,550 512,670" -fill '#1d4ed8' -draw "circle 512,550 512,630")
+          convert -size 1024x1024 xc:'#172554' "${GLYPH[@]}" /tmp/icon_full.png
+          convert -size 1024x1024 xc:none "${GLYPH[@]}" -resize 70% -background none -gravity center -extent 1024x1024 /tmp/icon_fg.png
+          find android/app/src/main/res -name 'ic_launcher*.png' | while read -r f; do
+            size=$(identify -format '%w' "$f")
+            case "$f" in
+              *foreground*) src=/tmp/icon_fg.png ;;
+              *) src=/tmp/icon_full.png ;;
+            esac
+            convert "$src" -resize "${size}x${size}" "PNG32:$f"
+          done
+          sed -i 's/#[0-9A-Fa-f]\{6\}/#172554/' android/app/src/main/res/values/ic_launcher_background.xml
+
+      - name: Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+
+      # Same signing key every build, so a new APK installs over the old one without losing app data.
+      - name: Restore signing key
+        id: keycache
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: apk-signing-key-v1
+
+      - name: Create signing key (first run only)
+        if: steps.keycache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair -keystore ~/.android/debug.keystore \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk MyPhotoGalleryPro.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyPhotoGalleryPro-apk
+          path: MyPhotoGalleryPro.apk
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: APK build ${{ github.run_number }}
+          body: "Download MyPhotoGalleryPro.apk below and install it on your Android phone."
+          files: MyPhotoGalleryPro.apk
