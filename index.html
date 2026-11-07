@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#172554">
+<title>My Photo Gallery Pro</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+:root{--navy:#172554;--blue:#1d4ed8;--bg:#f1f5f9;--ink:#0f172a;--muted:#64748b;--line:#dbe3ef;--red:#b91c1c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,"Noto Sans Bengali",Arial,sans-serif}
+header{background:var(--navy);color:white;padding:18px 16px;position:sticky;top:0;z-index:5;box-shadow:0 2px 10px #0002}
+header h1{font-size:21px;margin:0}header p{font-size:12px;margin:5px 0 0;color:#cbd5e1}
+main{max-width:1000px;margin:auto;padding:14px}.panel{background:white;border-radius:15px;padding:14px;margin-bottom:14px;box-shadow:0 2px 10px #0f172a10}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button,.filebtn{border:0;border-radius:10px;padding:10px 13px;background:var(--blue);color:white;font-weight:650;font-size:14px;cursor:pointer}
+button.gray,.filebtn.gray{background:#e2e8f0;color:#1e293b}button.red{background:#fee2e2;color:var(--red)}button:disabled{opacity:.45}
+input[type=file]{display:none}input,textarea{max-width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:9px;font:inherit}textarea{width:100%;min-height:75px}
+.muted{color:var(--muted);font-size:13px}.small{font-size:12px}.hidden{display:none!important}
+.dashboard{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.dashcard{background:white;border:1px solid var(--line);border-radius:15px;padding:18px;text-align:left;color:var(--ink);box-shadow:0 2px 10px #0f172a0d}
+.dashcard .emoji{font-size:28px}.dashcard strong{display:block;font-size:18px;margin:6px 0}.dashcard span{color:var(--muted);font-size:13px}
+.pagehead{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap}
+.tabs{margin:12px 0}.tabs button{background:#e2e8f0;color:#0f172a}.tabs button.active{background:var(--blue);color:white}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,230px),1fr));gap:12px;margin-top:12px}
+.item{background:white;border:1px solid var(--line);border-radius:13px;padding:10px;min-width:0}
+.item img,.item video{width:100%;max-height:260px;object-fit:contain;background:#0f172a;border-radius:9px;display:block}
+.serial{font-weight:750;color:var(--blue);margin:0 0 7px}.caption{white-space:pre-wrap;margin:8px 0;font-size:14px;overflow-wrap:anywhere}
+.item .row{margin-top:8px}.item .row button{padding:8px 10px;font-size:12px}
+.item input[type=checkbox]{width:19px;height:19px;accent-color:var(--blue)}
+.status{padding:11px;border-radius:9px;background:#e0f2fe;margin-top:10px;font-size:13px;line-height:1.5}
+.empty{background:white;border:1px dashed #b8c5d8;padding:28px 14px;text-align:center;border-radius:13px;color:var(--muted);grid-column:1/-1}
+.notice{font-size:12px;color:var(--muted);line-height:1.6}.pinrow{margin-top:12px}
+@media(min-width:650px){.dashboard{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+<header><h1>📷 My Photo Gallery Pro</h1><p>ছবি ও ভিডিও আলাদা গ্যালারি · Original Quality · Offline</p></header>
+<main id="main">
+<section id="homeView">
+  <div class="panel">
+    <h2 style="margin:0 0 6px">Main Dashboard</h2>
+    <p class="muted">ছবি এবং ভিডিও আলাদা জায়গায় সাজানো থাকবে। যেটি দেখতে চাও সেটি খোলো।</p>
+    <div class="dashboard">
+      <button class="dashcard" data-open="photo"><span class="emoji">🖼️</span><strong>All Pictures</strong><span id="photoSummary">0 ছবি</span></button>
+      <button class="dashcard" data-open="video"><span class="emoji">🎬</span><strong>All Videos</strong><span id="videoSummary">0 ভিডিও</span></button>
+    </div>
+    <div class="status" id="status">ফাইলগুলো এই ডিভাইসের Chrome ব্রাউজারে থাকবে। GitHub বা অন্য ফোনে মিডিয়া আপলোড হয় না।</div>
+  </div>
+  <section class="panel">
+    <h3 style="margin-top:0">PIN Lock</h3>
+    <p class="muted">PIN এই ব্রাউজারে স্থানীয়ভাবে কাজ করে। এটি অনলাইন অ্যাকাউন্ট সুরক্ষা নয়।</p>
+    <div class="row"><input id="pin" type="password" inputmode="numeric" maxlength="8" placeholder="৪–৮ সংখ্যার PIN"><button id="setPin">PIN সেট / পরিবর্তন</button><button class="gray" id="lock">Lock Now</button></div>
+    <div id="unlockArea" class="row hidden pinrow"><input id="unlockPin" type="password" inputmode="numeric" placeholder="PIN লিখুন"><button id="unlock">Unlock</button></div>
+  </section>
+  <section class="panel">
+    <h3 style="margin-top:0">ডেটা ব্যাকআপ</h3>
+    <p class="muted">JSON-এ শুধু নাম, ক্যাপশন ও স্ট্যাটাসের মতো তথ্য থাকবে; আসল ছবি/ভিডিও নয়। ফোনের মূল ফাইলও রেখে দাও।</p>
+    <button class="gray" id="export">Metadata Backup (JSON)</button>
+  </section>
+</section>
+
+<section id="mediaView" class="hidden">
+  <div class="panel">
+    <div class="pagehead">
+      <div><button class="gray" id="backHome">← Dashboard</button><h2 id="mediaTitle" style="display:inline-block;margin:0 0 0 8px">All Pictures</h2></div>
+      <span class="muted" id="mediaCount"></span>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <label class="filebtn" id="uploadLabel" for="mediaInput">＋ ছবি Upload</label>
+      <input id="mediaInput" type="file" multiple>
+      <input id="search" placeholder="Serial বা ফাইলের নাম খুঁজুন">
+    </div>
+    <div class="row tabs" id="tabs">
+      <button class="active" data-tab="all">All</button>
+      <button data-tab="unused">Unused</button>
+      <button data-tab="used">Used</button>
+      <button data-tab="trash">Recycle Bin</button>
+    </div>
+    <div class="row">
+      <button class="gray" id="selectAll">সব নির্বাচন</button>
+      <button class="gray" id="bulkUsed">Used</button>
+      <button class="gray" id="bulkUnused">Unused</button>
+      <button class="red" id="bulkTrash">Recycle</button>
+      <button class="red" id="bulkDelete">Delete Forever</button>
+      <button class="gray" id="shareSelected">Share Selected</button>
+      <span class="muted" id="selectedCount">0 নির্বাচিত</span>
+    </div>
+    <div id="gallery" class="grid"></div>
+  </div>
+</section>
+
+<section class="panel">
+  <p class="notice">গুরুত্বপূর্ণ: ছবি/ভিডিও এই একই ফোনের Chrome IndexedDB-তে রাখা হয়। Browser data clear করলে ফাইল হারাতে পারে। GitHub Pages শুধু অ্যাপের কোড রাখে, মিডিয়া নয়। ১০০০+ ফাইলের ধারণক্ষমতা ফোন ও ব্রাউজারের ফাঁকা স্টোরেজের ওপর নির্ভর করে। Original file compression ছাড়াই রাখা হয়।</p>
+</section>
+</main>
+<div id="lockedScreen" class="hidden" style="position:fixed;inset:0;background:#0f172aee;z-index:20;display:grid;place-items:center;padding:20px">
+ <div class="panel" style="width:min(100%,380px)"><h2>🔒 App Locked</h2><p class="muted">অ্যাপ খুলতে PIN লিখুন।</p><input id="screenPin" type="password" inputmode="numeric" placeholder="PIN" style="width:100%"><button id="screenUnlock" style="width:100%;margin-top:10px">Unlock</button></div>
+</div>
+<script src="app.js"></script>
+</body></html>
