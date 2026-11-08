@@ -12,7 +12,7 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -29,80 +29,269 @@ jobs:
         run: |
           mkdir -p www
           tar --exclude='./.git' --exclude='./.github' --exclude='./www' \
-              --exclude='./node_modules' --exclude='./android' \
+              --exclude='./node_modules' --exclude='./android' --exclude='./android-extra' \
               --exclude='*.zip' --exclude='./README.md' \
               --exclude='./package.json' --exclude='./package-lock.json' \
               --exclude='./capacitor.config.json' -cf - . | tar -xf - -C www
           ls -la www
-
-      - name: Add native share helper
-        run: |
-          cat > www/native-bridge.js <<'EOF'
-          (function () {
-            var C = window.Capacitor;
-            if (!C || !C.isNativePlatform || !C.isNativePlatform()) return;
-
-            function call(plugin, method, opts) {
-              var P = C.Plugins && C.Plugins[plugin];
-              if (P && P[method]) return P[method](opts);
-              return C.nativePromise(plugin, method, opts);
-            }
-
-            function toBase64(blob) {
-              return new Promise(function (resolve, reject) {
-                var r = new FileReader();
-                r.onload = function () { resolve(String(r.result).split(',')[1] || ''); };
-                r.onerror = function () { reject(r.error); };
-                r.readAsDataURL(blob);
-              });
-            }
-
-            // 3MB chunks (multiple of 3 bytes) so big videos do not choke the bridge
-            var CHUNK = 3 * 1024 * 1024;
-
-            async function writeToCache(file, path) {
-              for (var off = 0, first = true; off < file.size || first; off += CHUNK) {
-                var data = await toBase64(file.slice(off, off + CHUNK));
-                var args = { path: path, data: data, directory: 'CACHE' };
-                if (first) { args.recursive = true; await call('Filesystem', 'writeFile', args); first = false; }
-                else { await call('Filesystem', 'appendFile', args); }
-              }
-              var u = await call('Filesystem', 'getUri', { path: path, directory: 'CACHE' });
-              return u.uri;
-            }
-
-            navigator.canShare = function () { return true; };
-
-            navigator.share = async function (data) {
-              data = data || {};
-              var files = data.files || [];
-              var uris = [];
-              var stamp = Date.now();
-              for (var i = 0; i < files.length; i++) {
-                var safe = (stamp + '_' + i + '_' + (files[i].name || 'file')).replace(/[^\w.\-]+/g, '_');
-                uris.push(await writeToCache(files[i], 'share/' + safe));
-              }
-              try {
-                await call('Share', 'share', {
-                  title: data.title || '',
-                  text: data.text || '',
-                  files: uris,
-                  dialogTitle: 'Share'
-                });
-              } catch (e) {
-                if (/cancel/i.test(String((e && e.message) || e))) {
-                  var err = new Error('Share canceled');
-                  err.name = 'AbortError';
-                  throw err;
-                }
-                throw e;
-              }
-            };
-          })();
-          EOF
-          node --check www/native-bridge.js
-          sed -i 's#<script src="app.js"></script>#<script src="native-bridge.js"></script><script src="app.js"></script>#' www/index.html
           grep -q 'native-bridge.js' www/index.html
+
+      - name: Write Android extras (share-in plugin + patch script)
+        run: |
+          mkdir -p android-extra
+          cat > android-extra/MainActivity.java <<'EOF'
+          package com.nasim.photogallerypro;
+
+          import android.content.Intent;
+          import android.os.Bundle;
+
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(ShareInPlugin.class);
+                  super.onCreate(savedInstanceState);
+                  if (savedInstanceState == null) {
+                      handleShare(getIntent());
+                  }
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(new Intent(Intent.ACTION_MAIN));
+                  handleShare(intent);
+              }
+
+              private void handleShare(final Intent intent) {
+                  if (intent == null) return;
+                  final String action = intent.getAction();
+                  if (!Intent.ACTION_SEND.equals(action) && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return;
+                  final android.content.Context ctx = getApplicationContext();
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          boolean added = ShareInPlugin.queue(ctx, intent);
+                          if (!added) return;
+                          runOnUiThread(new Runnable() {
+                              @Override
+                              public void run() {
+                                  try {
+                                      if (getBridge() != null && getBridge().getWebView() != null) {
+                                          getBridge().getWebView().evaluateJavascript(
+                                              "window.dispatchEvent(new Event('nativeShare'))", null);
+                                      }
+                                  } catch (Exception ignored) {
+                                  }
+                              }
+                          });
+                      }
+                  }).start();
+              }
+          }
+          EOF
+          cat > android-extra/ShareInPlugin.java <<'EOF'
+          package com.nasim.photogallerypro;
+
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.OpenableColumns;
+
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /** Receives files/text shared from other apps and hands them to the web app. */
+          @CapacitorPlugin(name = "ShareIn")
+          public class ShareInPlugin extends Plugin {
+
+              private static final List<JSObject> PENDING = new ArrayList<>();
+
+              /** Copies everything in a SEND / SEND_MULTIPLE intent into cache and queues it. Runs off the main thread. */
+              static boolean queue(Context ctx, Intent intent) {
+                  if (intent == null) return false;
+                  String action = intent.getAction();
+                  if (!Intent.ACTION_SEND.equals(action) && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return false;
+
+                  List<Uri> uris = new ArrayList<>();
+                  if (Intent.ACTION_SEND.equals(action)) {
+                      Uri one;
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          one = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+                      } else {
+                          one = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+                      }
+                      if (one != null) uris.add(one);
+                  } else {
+                      ArrayList<Uri> many;
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          many = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class);
+                      } else {
+                          many = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+                      }
+                      if (many != null) uris.addAll(many);
+                  }
+
+                  String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+                  if (text == null) text = "";
+
+                  JSObject entry = new JSObject();
+                  entry.put("text", text);
+                  JSArray files = new JSArray();
+                  File dir = new File(ctx.getCacheDir(), "incoming");
+                  if (!dir.exists()) dir.mkdirs();
+                  long stamp = System.currentTimeMillis();
+                  int i = 0;
+                  for (Uri u : uris) {
+                      try {
+                          ContentResolver cr = ctx.getContentResolver();
+                          String name = displayName(cr, u);
+                          String type = cr.getType(u);
+                          String safe = stamp + "_" + (i++) + "_" + name.replaceAll("[^A-Za-z0-9._-]+", "_");
+                          File out = new File(dir, safe);
+                          InputStream in = cr.openInputStream(u);
+                          if (in == null) continue;
+                          OutputStream os = new FileOutputStream(out);
+                          try {
+                              byte[] buf = new byte[64 * 1024];
+                              int n;
+                              while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                          } finally {
+                              os.close();
+                              in.close();
+                          }
+                          JSObject f = new JSObject();
+                          f.put("path", Uri.fromFile(out).toString());
+                          f.put("name", name);
+                          f.put("type", type == null ? "" : type);
+                          files.put(f);
+                      } catch (Exception ignored) {
+                          // skip a file we cannot read
+                      }
+                  }
+                  entry.put("files", files);
+                  if (files.length() == 0 && text.trim().isEmpty()) return false;
+                  synchronized (PENDING) {
+                      PENDING.add(entry);
+                  }
+                  return true;
+              }
+
+              private static String displayName(ContentResolver cr, Uri u) {
+                  String name = null;
+                  Cursor c = null;
+                  try {
+                      c = cr.query(u, null, null, null, null);
+                      if (c != null && c.moveToFirst()) {
+                          int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                          if (idx >= 0) name = c.getString(idx);
+                      }
+                  } catch (Exception ignored) {
+                  } finally {
+                      if (c != null) c.close();
+                  }
+                  if (name == null || name.isEmpty()) {
+                      String p = u.getLastPathSegment();
+                      name = (p == null || p.isEmpty()) ? "shared" : p;
+                  }
+                  return name;
+              }
+
+              @PluginMethod
+              public void takeIncoming(PluginCall call) {
+                  JSArray arr = new JSArray();
+                  synchronized (PENDING) {
+                      for (JSObject o : PENDING) arr.put(o);
+                      PENDING.clear();
+                  }
+                  JSObject res = new JSObject();
+                  res.put("items", arr);
+                  call.resolve(res);
+              }
+          }
+          EOF
+          cat > android-extra/patch_android.py <<'EOF'
+          #!/usr/bin/env python3
+          """Patches the generated Capacitor Android project:
+            - Share-to-app intent filters (images, videos, text)
+            - navy splash screen + status/navigation bar colour
+          Run from the repo root after `npx cap add android`.
+          """
+          import pathlib
+          import re
+          import shutil
+
+          ROOT = pathlib.Path("android/app/src/main")
+          PKG_DIR = ROOT / "java/com/nasim/photogallerypro"
+
+          # ---- Java sources ----
+          PKG_DIR.mkdir(parents=True, exist_ok=True)
+          for name in ("MainActivity.java", "ShareInPlugin.java"):
+              shutil.copy(pathlib.Path("android-extra") / name, PKG_DIR / name)
+
+          # ---- Manifest: accept shared files ----
+          mf = ROOT / "AndroidManifest.xml"
+          s = mf.read_text(encoding="utf-8")
+          if "android.intent.action.SEND" not in s:
+              filters = """
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="image/*" />
+                          <data android:mimeType="video/*" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND_MULTIPLE" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="image/*" />
+                          <data android:mimeType="video/*" />
+                      </intent-filter>
+                  """
+              i = s.index("</activity>")
+              s = s[:i] + filters + s[i:]
+              mf.write_text(s, encoding="utf-8")
+          print("manifest patched")
+
+          # ---- Splash + bar colours ----
+          values = ROOT / "res/values"
+          (values / "mgp_colors.xml").write_text(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              '    <color name="mgp_navy">#172554</color>\n</resources>\n',
+              encoding="utf-8",
+          )
+          st = values / "styles.xml"
+          if st.exists():
+              t = st.read_text(encoding="utf-8")
+              # splash: navy background instead of the default logo image
+              t = t.replace("@drawable/splash", "@color/mgp_navy")
+              # status / navigation bar colour for the main theme
+              t = re.sub(
+                  r'(<style name="AppTheme\.NoActionBar"[^>]*>)',
+                  r'\1\n        <item name="android:statusBarColor">@color/mgp_navy</item>'
+                  r'\n        <item name="android:navigationBarColor">@color/mgp_navy</item>',
+                  t,
+                  count=1,
+              )
+              st.write_text(t, encoding="utf-8")
+              print("styles patched")
+          EOF
 
       - name: Create Capacitor Android project
         run: |
@@ -112,7 +301,9 @@ jobs:
           {
             "appId": "com.nasim.photogallerypro",
             "appName": "My Photo Gallery Pro",
-            "webDir": "www"
+            "webDir": "www",
+            "backgroundColor": "#172554",
+            "android": { "adjustMarginsForEdgeToEdge": "auto" }
           }
           EOF
           npx cap add android
@@ -156,11 +347,23 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
+      # First try with "Share to app" + splash/status bar colour.
+      # If that extra part fails to compile, build again without it so you still get a working APK.
       - name: Build APK
-        working-directory: android
         run: |
+          cp -r android/app/src /tmp/src-backup
+          python3 android-extra/patch_android.py
+          cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          if ./gradlew assembleDebug --no-daemon; then
+            echo "full build ok (share-in included)"
+          else
+            echo "::warning::Share-in part failed, rebuilding without it"
+            cd ..
+            rm -rf android/app/src && cp -r /tmp/src-backup android/app/src
+            cd android
+            ./gradlew assembleDebug --no-daemon
+          fi
 
       - name: Rename APK
         run: cp android/app/build/outputs/apk/debug/app-debug.apk MyPhotoGalleryPro.apk
